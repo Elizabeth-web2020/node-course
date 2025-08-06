@@ -1,88 +1,141 @@
 const express = require('express');
 const session = require('express-session');
-const FileStore = require('session-file-store')(session);
+const MongoStore = require('connect-mongo');
 const morgan = require('morgan');
-
 const bodyParser = require('body-parser');
+const { MongoClient } = require('mongodb');
+const bcrypt = require('bcrypt');
+const flash = require('connect-flash');
+
 const app = express();
 
-// Налаштування шаблонізатора
+const mongoUrl = 'mongodb://localhost:27017/site';
+const client = new MongoClient(mongoUrl);
+
+let usersCollection;
+let tasksCollection;
+
 app.set('view engine', 'pug');
 app.set('views', './views');
-// статика
+
 app.use(express.static(`${__dirname}/assets`));
 
-// Для роботи з кукі
 app.use(bodyParser.urlencoded({ extended: false }));
+
 app.use(session({
-  store: new FileStore({
-    path: './sessions',      // Тека де зберігаються сесії
-    ttl: 3600,               // Час життя сесії у секундах (1 час)
-    retries: 1,              // Спроб запису файлу
+  store: MongoStore.create({
+    mongoUrl,
+    collectionName: 'sessions',
+    ttl: 60 * 60,
   }),
-  secret: 'your_secret_key_39393', // Ваш секрет для кукі
-  resave: false, // не зберігати якщо не змінювалась
-  saveUninitialized: false, // не зберігати в теку якщо не добавляли дані
-  cookie: {
-    maxAge: 3600000          // Час життя кукі у мс (1 час)
-  },
+  secret: 'your_secret_key_39393',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 3600000 },
 }));
 
-app.use(morgan('tiny', {
-    skip: (req) => req.url.startsWith('/.well-known'),
-  }))
-
-
-
+app.use(flash());
 app.use((req, res, next) => {
-  app.locals.username = req.session?.user || null;
+  res.locals.success = req.flash('success');
+  res.locals.error = req.flash('error');
   next();
 });
 
-app.get('/', (req, res)=>{
-  console.log(req.session.user);
-  res.render('main',)
+app.use(morgan('tiny'));
+
+app.use((req, _res, next) => {
+  app.locals.user = req.session?.user || null;
+  next();
 });
 
-app.get('/common', (req, res)=>{
-  res.render('common')
+app.get('/', (_req, res) => {
+  res.render('main');
 });
 
+app.get('/register', (_req, res) => {
+  res.render('register');
+});
 
-// Сторінка логіну
-app.get('/login', (req, res) => {
+app.post('/register', async (req, res) => {
+  let { email, password, role } = req.body;
+  email = email.trim().toLowerCase();
+  role = (role || 'user').toLowerCase();
+
+  const exists = await usersCollection.findOne({ email });
+
+   if (exists) {
+    req.flash('error', 'user exists');
+    return res.redirect('/register');
+  }
+
+  const hash = await bcrypt.hash(password.trim(), 10);
+
+  await usersCollection.insertOne({
+    email,
+    password: hash,
+    role
+  });
+
+  req.flash('success', 'user created successfully, please login');
+  res.redirect('/login');
+});
+
+app.get('/login', (_req, res) => {
   res.render('login');
 });
 
-// Обробка форми логіну
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
+app.post('/login', async (req, res) => {
+  let { email, password } = req.body;
+  email = email.trim().toLowerCase();
 
-  // Простий хардкод (можна замінити на базу)
-  if ((username === 'admin' && password === '123') ||
-  (username === 'alex' && password === '777')
-  ) {
-    req.session.user = username;
-    return res.redirect('/dashboard');
+  const user = await usersCollection.findOne({ email });
+  if (!user) {
+    req.flash('error', 'login or password is incorrect');
+    return res.render('login', { error: 'login or password is incorrect' });
   }
 
-  res.render('login', { error: 'Невірний логін або пароль' });
+  const valid = await bcrypt.compare(password.trim(), user.password);
+  if (!valid) {
+    req.flash('error', 'login or password is incorrect');
+    return res.render('login', { error: 'login or password is incorrect' });
+  }
+
+  req.session.user = { email: user.email, role: user.role };
+  res.redirect('/dashboard');
 });
 
-// Захищена сторінка
-app.get('/dashboard', (req, res) => {
-  if (!req.session.user) return res.redirect('/login');
-  res.render('dashboard', { user: req.session.user });
+app.get('/dashboard', async (req, res) => {
+  if (!req.session.user) {
+    return res.redirect('/login');
+  }
+
+  const { role, email } = req.session.user;
+  const tasks = await tasksCollection.find({ role }).toArray();
+
+  res.render('dashboard', { user: email, tasks });
 });
 
-// Вихід
 app.get('/logout', (req, res) => {
   req.session.destroy(() => {
     res.redirect('/login');
   });
 });
 
-// Запуск
-app.listen(3000, () => {
-  console.log('Сервер запущено на http://localhost:3000');
+async function dbConnect() {
+  try {
+    await client.connect();
+    const db = client.db('site');
+    usersCollection = db.collection('users');
+    tasksCollection = db.collection('tasks');
+    console.log('MongoDB connected');
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  }
+}
+
+dbConnect().then(() => {
+  app.listen(3500, () => {
+    console.log('Server http://localhost:3500');
+  });
 });
